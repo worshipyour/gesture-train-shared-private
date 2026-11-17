@@ -29,6 +29,36 @@ def atomic_json(path, value):
     os.replace(str(temp), str(path))
 
 
+def tail_log(path, lines=40):
+    if not path.is_file():
+        return "(log not created)"
+    with path.open("rb") as stream:
+        stream.seek(0, 2)
+        size = stream.tell()
+        stream.seek(max(0, size - 32768))
+        return "\n".join(stream.read().decode("utf-8", errors="replace").splitlines()[-lines:])
+
+
+def inspect_run(run_dir):
+    """Read diagnostics only; never reserve a GPU or launch training."""
+    run_dir = run_dir.expanduser().resolve()
+    if not run_dir.is_dir():
+        print("Run directory does not exist: " + str(run_dir), file=sys.stderr)
+        return 1
+    print("Python: %s\nRun directory: %s" % (sys.executable, run_dir))
+    for name in ("status.json", "queue.log", "baseline.log", "teacher.log", "fgd.log"):
+        path = run_dir / name
+        if path.is_file():
+            print("\n--- %s ---\n%s" % (name, tail_log(path, 60)))
+    try:
+        result = subprocess.run(["nvidia-smi"], stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                                universal_newlines=True, timeout=15)
+        print("\n--- nvidia-smi (exit %s) ---\n%s" % (result.returncode, result.stdout))
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        print("GPU diagnostic unavailable: " + str(exc))
+    return 0
+
+
 def reserve_gpu(index):
     path = Path(tempfile.gettempdir()) / ("gesture_fgd_%s_gpu%s.lock" % (os.getuid(), index))
     lock = path.open("a")
@@ -88,7 +118,8 @@ def best_metrics(folder):
 
 
 def write_summary(args, state):
-    summary = {"split": "validation", "selection": "0.1*mAP50 + 0.9*mAP50_95",
+    summary = {"status": state["status"], "error": state.get("error"),
+               "split": "validation", "selection": "0.1*mAP50 + 0.9*mAP50_95",
                "test_evaluated": False, "seed": args.seed, "student_batch": args.student_batch,
                "jobs": state["jobs"], "metrics": {}}
     for name, job in state["jobs"].items():
@@ -100,6 +131,7 @@ def write_summary(args, state):
                                            ("P", "R", "F1_from_mean_PR", "mAP50", "mAP50_95")}
     atomic_json(args.run_dir / "summary.json", summary)
     lines = ["# %s 训练验证结果" % args.run_dir.name, "",
+             "队列状态：" + state["status"], "错误：" + state.get("error", "无"), "",
              "验证集按原 fitness 选择权重；未使用测试集选配置。F1 为平均 P/R 推导值。", "",
              "| 训练 | P | R | F1* | mAP50 | mAP50–95 |", "|---|---:|---:|---:|---:|---:|"]
     for name, metrics in summary["metrics"].items():
@@ -149,6 +181,11 @@ def execute(args):
                 checkpoint = args.run_dir / name / "weights/best.pt"
                 state["jobs"][name].update(returncode=code,
                     status="complete" if code == 0 and checkpoint.is_file() else "failed")
+                if state["jobs"][name]["status"] == "failed":
+                    reason = "train.py exited with code %s" % code if code else "best.pt was not created"
+                    state["jobs"][name]["error"] = reason
+                    print("%s failed: %s\n%s" % (name, reason, tail_log(args.run_dir / (name + ".log"))),
+                          file=sys.stderr, flush=True)
                 del active[name]
                 save()
                 print("Finished %s: %s" % (name, state["jobs"][name]["status"]), flush=True)
@@ -174,6 +211,7 @@ def execute(args):
     except Exception as exc:
         # Allow already-started training to finish and retain its GPU lock.
         state["error"] = str(exc)
+        print("Queue error: " + str(exc), file=sys.stderr, flush=True)
         state["status"] = "waiting_for_started_jobs" if active else "failed"
         save()
         wait()
@@ -201,11 +239,14 @@ def parse_args():
     parser.add_argument("--fgd-weight", type=float, default=0.005)
     parser.add_argument("--run-dir", type=Path)
     parser.add_argument("--foreground", action="store_true")
+    parser.add_argument("--inspect-run", type=Path, help="read a previous run's status/logs/GPU state; starts no training")
     return parser.parse_args()
 
 
 def main():
     args = parse_args()
+    if args.inspect_run is not None:
+        return inspect_run(args.inspect_run)
     for attr in ("weights", "data", "hyp", "teacher_checkpoint"):
         value = getattr(args, attr)
         if value is not None:
