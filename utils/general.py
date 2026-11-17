@@ -600,6 +600,22 @@ def check_amp(model):
     device = next(model.parameters()).device  # get model device
     if device.type in ("cpu", "mps"):
         return False  # AMP only used on CUDA devices
+    channels = next(model.parameters()).shape[1]
+    if channels == 1:
+        # AutoShape is an RGB wrapper; probe the real single-channel model directly.
+        try:
+            probe_model = deepcopy(model).eval()
+            probe = torch.ones(1, 1, 224, 320, device=device)
+            with torch.no_grad():
+                full = probe_model(probe)[0]
+                with torch.cuda.amp.autocast():
+                    mixed = probe_model(probe)[0]
+            passed = torch.isfinite(mixed).all() and torch.allclose(full, mixed.float(), rtol=0.1, atol=0.1)
+            LOGGER.info(f"{prefix}single-channel check {'passed' if passed else 'failed'}")
+            return bool(passed)
+        except Exception as exc:
+            LOGGER.warning(f"{prefix}single-channel check failed, disabling AMP: {exc}")
+            return False
     f = ROOT / "data" / "images" / "bus.jpg"  # image to check
     im = f if f.exists() else "https://ultralytics.com/images/bus.jpg" if check_online() else np.ones((640, 640, 3))
     try:
@@ -1220,11 +1236,14 @@ def strip_optimizer(f="best.pt", s=""):
 
     Example: from utils.general import *; strip_optimizer()
     """
-    x = torch.load(f, map_location=torch.device("cpu"))
+    from distill_plugin.runtime import load_checkpoint
+    x = load_checkpoint(f, map_location=torch.device("cpu"))
     if x.get("ema"):
         x["model"] = x["ema"]  # replace model with ema
     for k in "optimizer", "best_fitness", "ema", "updates":  # keys
         x[k] = None
+    x.pop("fgd", None)  # deployment best.pt contains only the student, no training adapters
+    x.pop("scaler", None)
     x["epoch"] = -1
     x["model"].half()  # to FP16
     for p in x["model"].parameters():
@@ -1384,3 +1403,4 @@ if Path(inspect.stack()[0].filename).parent.parent.as_posix() in inspect.stack()
     cv2.imread, cv2.imwrite, cv2.imshow = imread, imwrite, imshow  # redefine
 
 # Variables ------------------------------------------------------------------------------------------------------------
+

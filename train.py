@@ -15,6 +15,7 @@ Tutorial:   https://docs.ultralytics.com/yolov5/tutorials/train_custom_data
 """
 
 import argparse
+import contextlib
 import math
 import os
 import random
@@ -84,6 +85,7 @@ from utils.general import (
 from utils.loggers import LOGGERS, Loggers
 from utils.loggers.comet.comet_utils import check_comet_resume
 from utils.loss import ComputeLoss, ComputeLoss_dis
+from distill_plugin.runtime import FGDTrainer, load_checkpoint, validate_teacher
 from utils.metrics import fitness
 from utils.plots import plot_evolve
 from utils.torch_utils import (
@@ -218,7 +220,7 @@ def train(hyp, opt, device, callbacks):
     if pretrained:
         with torch_distributed_zero_first(LOCAL_RANK):
             weights = attempt_download(weights)  # download if not found locally
-        ckpt = torch.load(weights, map_location="cpu", weights_only=False)  # load checkpoint to CPU to avoid CUDA memory leak
+        ckpt = load_checkpoint(weights, map_location="cpu")  # load checkpoint to CPU to avoid CUDA memory leak
         model = Model(cfg or ckpt["model"].yaml, ch=1, nc=nc, anchors=hyp.get("anchors")).to(device)  # create
         exclude = ["anchor"] if (cfg or hyp.get("anchors")) and not resume else []  # exclude keys
         csd = ckpt["model"].float().state_dict()  # checkpoint state_dict as FP32
@@ -229,8 +231,20 @@ def train(hyp, opt, device, callbacks):
         model = Model(cfg, ch=1, nc=nc, anchors=hyp.get("anchors")).to(device)  # create
     amp = check_amp(model)  # check AMP
 
-    if opt.teacher_weight:
-        teacher_ckpt = torch.load(opt.teacher_weight, map_location="cpu")
+    fgd = None
+    if opt.distill_method == "fgd" and not opt.teacher_weight:
+        raise ValueError("--distill-method fgd requires --teacher_weight")
+    if opt.teacher_weight and opt.distill_method == "fgd":
+        if RANK != -1 or (cuda and torch.cuda.device_count() > 1):
+            raise ValueError("FGD currently supports one visible GPU per job; use CUDA_VISIBLE_DEVICES.")
+        teacher_ckpt = load_checkpoint(opt.teacher_weight)
+        teacher_model = deepcopy(teacher_ckpt.get("ema") or teacher_ckpt["model"]).float().to(device)
+        validate_teacher(teacher_model, model, names)
+        teacher_model.eval().requires_grad_(False)
+        del teacher_ckpt
+        LOGGER.info(f"FGD teacher: {opt.teacher_weight} (EMA preferred, matching input geometry)")
+    elif opt.teacher_weight:
+        teacher_ckpt = load_checkpoint(opt.teacher_weight, map_location="cpu")
         teacher_model = Model(
             teacher_ckpt["model"].yaml,
             ch=1,
@@ -294,6 +308,10 @@ def train(hyp, opt, device, callbacks):
     accumulate = max(round(nbs / batch_size), 1)  # accumulate loss before optimizing
     hyp["weight_decay"] *= batch_size * accumulate / nbs  # scale weight_decay
     optimizer = smart_optimizer(model, opt.optimizer, hyp["lr0"], hyp["momentum"], hyp["weight_decay"])
+    if opt.teacher_weight and opt.distill_method == "fgd":
+        fgd = FGDTrainer(model, teacher_model, opt.teacher_weight, opt.fgd_weight,
+                         opt.fgd_warmup_epochs, opt.seed)
+        optimizer.add_param_group({"params": list(fgd.criterion.parameters()), "weight_decay": 0.0})
 
     # Scheduler
     if opt.cos_lr:
@@ -311,9 +329,15 @@ def train(hyp, opt, device, callbacks):
 
     # Resume
     best_fitness, start_epoch = 0.0, 0
+    resume_scaler = None
     if pretrained:
         if resume:
             best_fitness, start_epoch, epochs = smart_resume(ckpt, optimizer, ema, weights, epochs, resume)
+            resume_scaler = ckpt.get("scaler")
+            if fgd:
+                if not ckpt.get("fgd"):
+                    raise ValueError("Cannot resume FGD without saved adapter state; start a new run instead.")
+                fgd.load_state_dict(ckpt["fgd"])
         del ckpt, csd
 
     # DP mode
@@ -565,9 +589,12 @@ def train(hyp, opt, device, callbacks):
     results = (0, 0, 0, 0, 0, 0, 0)  # P, R, mAP@.5, mAP@.5-.95, val_loss(box, obj, cls)
     scheduler.last_epoch = start_epoch - 1  # do not move
     scaler = torch.cuda.amp.GradScaler(enabled=amp)
+    if resume_scaler:
+        scaler.load_state_dict(resume_scaler)
     stopper, stop = EarlyStopping(patience=opt.patience), False
     compute_loss = ComputeLoss(model)  # init loss class
-    compute_loss_dis = ComputeLoss_dis(model)  # init loss class
+    compute_loss_dis = ComputeLoss_dis(model) if opt.teacher_weight and fgd is None else None
+    params_to_clip = list(model.parameters()) + (list(fgd.criterion.parameters()) if fgd else [])
     callbacks.run("on_train_start")
     LOGGER.info(
         f"Image sizes {[imgsz[0] * 2, imgsz[1] * 2]} train, {[imgsz[0] * 2, imgsz[1] * 2]} val\n"
@@ -666,7 +693,7 @@ def train(hyp, opt, device, callbacks):
                         align_corners=False
                     )
                     # Forward
-            if opt.teacher_weight:
+            if opt.teacher_weight and fgd is None:
                 base_h, base_w = yuvs.shape[2], yuvs.shape[3]
                 yuvs_teacher = nn.functional.interpolate(
                     yuvs,
@@ -675,11 +702,12 @@ def train(hyp, opt, device, callbacks):
                     align_corners=False
                 )
             # print(amp)
-            with torch.amp.autocast('cuda', enabled=amp):
+            with torch.cuda.amp.autocast(enabled=amp):
                 # pred = model(imgs)  # forward
                 # print(imgs.shape, yuvs.shape)
-                pred = model(yuvs)
-                if opt.teacher_weight:
+                with (fgd.student_forward() if fgd else contextlib.nullcontext()):
+                    pred = model(yuvs)
+                if opt.teacher_weight and fgd is None:
                     with torch.no_grad():
                         pred_teacher = teacher_model(yuvs_teacher)[1]
 
@@ -723,7 +751,13 @@ def train(hyp, opt, device, callbacks):
                 #         print("NO LABEL IMAGE:", bi, paths[bi])
                 #     else:
                 #         print("image", bi, "has", n, "labels")
-                if opt.teacher_weight:
+                if fgd:
+                    targets_device = targets.to(device)
+                    loss, loss_items = compute_loss(pred, targets_device)
+                    kd_loss = fgd.loss(yuvs, targets_device, epoch + (i + 1) / nb)
+                    loss = loss + kd_loss * yuvs.shape[0]  # match ComputeLoss batch scaling
+                    loss_items = torch.cat((loss_items, kd_loss.detach().reshape(1)))
+                elif opt.teacher_weight:
                     loss, loss_items = compute_loss_dis(pred, pred_teacher, targets.to(device))
                 else:
                     loss, loss_items = compute_loss(pred, targets.to(device))  # loss scaled by batch_size
@@ -738,7 +772,7 @@ def train(hyp, opt, device, callbacks):
             # Optimize - https://pytorch.org/docs/master/notes/amp_examples.html
             if ni - last_opt_step >= accumulate:
                 scaler.unscale_(optimizer)  # unscale gradients
-                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=10.0)  # clip gradients
+                torch.nn.utils.clip_grad_norm_(params_to_clip, max_norm=10.0)  # clip gradients
                 scaler.step(optimizer)  # optimizer.step
                 scaler.update()
                 optimizer.zero_grad()
@@ -764,6 +798,9 @@ def train(hyp, opt, device, callbacks):
                 if callbacks.stop_training:
                     return
             # end batch ------------------------------------------------------------------------------------------------
+
+        if fgd:
+            fgd.log_epoch(save_dir / "fgd_metrics.jsonl", epoch)
 
         # Scheduler
         lr = [x["lr"] for x in optimizer.param_groups]  # for loggers
@@ -795,7 +832,7 @@ def train(hyp, opt, device, callbacks):
             if fi > best_fitness:
                 best_fitness = fi
             if opt.teacher_weight:
-                log_vals = list(mloss[:3]) + list(results) + lr  # 不把 dis_loss 传给 YOLOv5 logger
+                log_vals = list(mloss[:3]) + list(results) + lr[:3]  # FGD details use fgd_metrics.jsonl
             else:
                 log_vals = list(mloss) + list(results) + lr
 
@@ -805,11 +842,16 @@ def train(hyp, opt, device, callbacks):
             if (not nosave) or (final_epoch and not evolve):  # if save
                 ckpt = {
                     "epoch": epoch,
+                    "selection_epoch": epoch,
+                    "validation_metrics": {"P": float(results[0]), "R": float(results[1]),
+                                           "mAP50": float(results[2]), "mAP50_95": float(results[3])},
                     "best_fitness": best_fitness,
                     "model": deepcopy(de_parallel(model)).half(),
                     "ema": deepcopy(ema.ema).half(),
                     "updates": ema.updates,
                     "optimizer": optimizer.state_dict(),
+                    "scaler": scaler.state_dict(),
+                    "fgd": fgd.state_dict() if fgd else None,
                     "opt": vars(opt),
                     "git": GIT_INFO,  # {remote, branch, commit} if a git repo
                     "date": datetime.now().isoformat(),
@@ -839,7 +881,8 @@ def train(hyp, opt, device, callbacks):
         LOGGER.info(f"\n{epoch - start_epoch + 1} epochs completed in {(time.time() - t0) / 3600:.3f} hours.")
         for f in last, best:
             if f.exists():
-                strip_optimizer(f)  # strip optimizers
+                if not (fgd and f == last):
+                    strip_optimizer(f)  # retain resumable FGD last.pt; best.pt stays student-only
                 if f is best:
                     LOGGER.info(f"\nValidating {f}...")
                     results, _, _ = validate.run(
@@ -890,7 +933,11 @@ def parse_opt(known=False):
     """
     parser = argparse.ArgumentParser()
     parser.add_argument("--weights", type=str, default="", help="initial weights path")
-    parser.add_argument("--teacher_weight", type=str, default=None, help="initial weights path")
+    parser.add_argument("--teacher_weight", "--teacher-weights", type=str, default=None, help="teacher checkpoint")
+    parser.add_argument("--distill-method", choices=["legacy", "fgd"], default="legacy",
+                        help="legacy output KD or FGD feature KD (same input geometry)")
+    parser.add_argument("--fgd-weight", type=float, default=0.005, help="external FGD loss weight")
+    parser.add_argument("--fgd-warmup-epochs", type=float, default=3.0, help="linear FGD gain warmup")
     parser.add_argument("--cfg", type=str, default="", help="model.yaml path")
     parser.add_argument("--data", type=str, default=ROOT / "data/coco128.yaml", help="dataset.yaml path")
     parser.add_argument("--hyp", type=str, default=ROOT / "data/hyps/hyp.scratch-low.yaml", help="hyperparameters path")
@@ -964,8 +1011,10 @@ def main(opt, callbacks=Callbacks()):
     """
     if RANK in {-1, 0}:
         print_args(vars(opt))
-        check_git_status()
-        check_requirements(ROOT / "requirements.txt")
+        if os.getenv("YOLOv5_SKIP_UPDATE_CHECK") != "1":
+            check_git_status()
+        if (ROOT / "requirements.txt").is_file():
+            check_requirements(ROOT / "requirements.txt")
 
     # Resume (from specified or most recent last.pt)
     if opt.resume and not check_comet_resume(opt) and not opt.evolve:
@@ -976,8 +1025,8 @@ def main(opt, callbacks=Callbacks()):
             with open(opt_yaml, errors="ignore") as f:
                 d = yaml.safe_load(f)
         else:
-            d = torch.load(last, map_location="cpu")["opt"]
-        opt = argparse.Namespace(**d)  # replace
+            d = load_checkpoint(last, map_location="cpu")["opt"]
+        opt = argparse.Namespace(**{**vars(parse_opt(True)), **d})  # old checkpoints inherit new defaults
         opt.cfg, opt.weights, opt.resume = "", str(last), True  # reinstate
         if is_url(opt_data):
             opt.data = check_file(opt_data)  # avoid HUB resume auth timeout
@@ -1315,3 +1364,4 @@ if __name__ == "__main__":
     opt = parse_opt()
 
     main(opt)
+

@@ -60,18 +60,7 @@ from utils.general import (
 )
 from utils.torch_utils import copy_attr, smart_inference_mode
 
-USE_FLASH_ATTN = False
-try:
-    import torch
-    if torch.cuda.is_available() and torch.cuda.get_device_capability()[0] >= 8:  # Ampere or newer
-        from flash_attn.flash_attn_interface import flash_attn_func
-        USE_FLASH_ATTN = True
-    else:
-        from torch.nn.functional import scaled_dot_product_attention as sdpa
-        print("FlashAttention is not available on this device. Using scaled_dot_product_attention instead.")
-except Exception:
-    from torch.nn.functional import scaled_dot_product_attention as sdpa
-    print("FlashAttention is not available on this device. Using scaled_dot_product_attention instead.")
+# The provided Conv/C3/SPPF model has no attention layers; no FlashAttention/SDPA import is needed.
 
 def autopad(k, p=None, d=1):
     """Pad kernel to preserve spatial shape for stride=1."""
@@ -788,3 +777,4 @@ class Detections:
     def __repr__(self):
         """Returns a string representation of the YOLOv5 object, including its class and formatted results."""
         return f"YOLOv5 {self.__class__} instance\n" + self.__str__()
+
