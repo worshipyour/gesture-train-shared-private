@@ -4,6 +4,7 @@
 import json
 import os
 import warnings
+from copy import deepcopy
 from pathlib import Path
 
 import pkg_resources as pkg
@@ -460,10 +461,13 @@ def log_tensorboard_graph(tb, model, imgsz=(640, 640)):
     try:
         p = next(model.parameters())  # for device, type
         imgsz = (imgsz, imgsz) if isinstance(imgsz, int) else imgsz  # expand
-        im = torch.zeros((1, 3, *imgsz)).to(p.device).type_as(p)  # input image (WARNING: must be zeros, not empty)
+        graph_model = deepcopy(de_parallel(model)).eval()  # tracing must not update training BatchNorm state
+        channels = next(m.in_channels for m in graph_model.modules() if isinstance(m, torch.nn.Conv2d))
+        im = torch.zeros((1, channels, *imgsz)).to(p.device).type_as(p)
         with warnings.catch_warnings():
             warnings.simplefilter("ignore")  # suppress jit trace warning
-            tb.add_graph(torch.jit.trace(de_parallel(model), im, strict=False), [])
+            with torch.no_grad():
+                tb.add_graph(torch.jit.trace(graph_model, im, strict=False, check_trace=False), [])
     except Exception as e:
         LOGGER.warning(f"WARNING ⚠️ TensorBoard graph visualization failure {e}")
 
