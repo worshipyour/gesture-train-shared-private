@@ -1,0 +1,33 @@
+path: /home/sunyu/project/gesture_asc/gesture_dataset_main_8x_shared/ # dataset root dir
+train: images/train
+val: images/val
+
+
+train: /home/sunyu/project/gesture_asc/gesture_dataset_main_8x_shared/images/train
+
+val: 
+- /home/sunyu/project/gesture_asc/gesture_dataset_main_8x_shared/images/val
+- /home/sunyu/project/gesture_asc/hand_bbox_13cls_CWFfull_FTEr1full_HA7cls20k_cls6PalmLRCleanCWF_cl6HADeleted_val_balance_12x/images/val
+
+
+#nc: 1
+
+# Classes
+names:
+  0: open_palm
+  1: index_up
+  2: O-Shape
+  3: fist
+  4: thumb_up 
+  5: thumb_down
+  6: random
+  7: L-shape
+  8: thumb_left
+  9: thumb_right
+  10: ok
+  11: Close_Pinch
+  12: Open_Pinch
+  13: heart_single_hand
+  14: heart_two_hand
+  15: palm_right
+  16: palm_left
