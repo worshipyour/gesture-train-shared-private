@@ -1,0 +1,11 @@
+# Separate environment only. Install a compatible torch CUDA wheel separately for GPU use.
+aimet-torch==2.44.0
+torch==2.5.1
+torchvision==0.20.1
+numpy>=1.24,<2
+onnx>=1.19,<1.21
+onnxruntime>=1.20
+opencv-python<4.12
+ultralytics>=8.3,<9
+seaborn
+GitPython
