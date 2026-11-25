@@ -45,26 +45,41 @@ if [[ ! -x "$conda_tool" ]]; then
   exit 2
 fi
 
+resolve_env() {
+  "$conda_tool" env list --json | python -c \
+    'import json,os,sys; matches=[p for p in json.load(sys.stdin)["envs"] if os.path.basename(p)==sys.argv[1]]; assert len(matches)<=1, "Ambiguous Conda environment name"; print(matches[0] if matches else "")' "$qat_env"
+}
+
+env_prefix="$(resolve_env)"
+if [[ -z "$env_prefix" ]]; then
+  if [[ "$mode" != "--install" ]]; then
+    echo "Environment not found: $qat_env. Run --install on the server first." >&2
+    exit 2
+  fi
+  "$conda_tool" create -y -n "$qat_env" python=3.10 pip
+  env_prefix="$(resolve_env)"
+fi
+if [[ -z "$env_prefix" || ! -x "$env_prefix/bin/python" ]]; then
+  echo "Cannot locate isolated environment Python: $qat_env. No pip command executed." >&2
+  exit 2
+fi
+qat_python="$env_prefix/bin/python"
+echo "Using isolated environment Python: $qat_python"
+# Older Conda versions do not support --no-capture-output. Avoid conda run entirely.
+"$qat_python" -c 'import sys; assert sys.version_info >= (3,10), "Existing environment uses Python <3.10; choose a new dedicated name"'
+
 if [[ "$mode" == "--install" ]]; then
   echo "Dependencies will be downloaded on THIS SERVER into isolated environment: $qat_env"
-  env_exists="$("$conda_tool" env list --json | python -c 'import json,os,sys; name=sys.argv[1]; print(int(any(os.path.basename(p)==name for p in json.load(sys.stdin)["envs"])))' "$qat_env")"
-  if [[ "$env_exists" == "1" ]]; then
-    "$conda_tool" run --no-capture-output -n "$qat_env" python -c \
-      'import sys; assert sys.version_info >= (3,10), "Existing environment uses Python <3.10; choose a new dedicated name"'
-  else
-    "$conda_tool" create -y -n "$qat_env" python=3.10 pip
-  fi
   # Explicit wheel choice for the older server GPUs; the smoke test must still confirm driver compatibility.
-  "$conda_tool" run --no-capture-output -n "$qat_env" python -m pip install \
+  "$qat_python" -m pip install \
     torch==2.5.1 torchvision==0.20.1 --index-url https://download.pytorch.org/whl/cu118
-  "$conda_tool" run --no-capture-output -n "$qat_env" python -m pip install \
+  "$qat_python" -m pip install \
     -r qat_plugin/requirements_2026-11-24.txt
-  "$conda_tool" run --no-capture-output -n "$qat_env" python -m pip check
-  "$conda_tool" run --no-capture-output -n "$qat_env" python qat_plugin/run_2026-11-24.py --preflight
+  "$qat_python" -m pip check
+  "$qat_python" qat_plugin/run_2026-11-24.py --preflight
   echo "Installed. Next run --check, then the real-data --smoke command from the README."
 else
   # CPU tests do not occupy either GPU or train on the real dataset.
   CUDA_VISIBLE_DEVICES="" OMP_NUM_THREADS=2 MKL_NUM_THREADS=2 \
-    "$conda_tool" run --no-capture-output -n "$qat_env" \
-    python -m unittest discover -s qat_plugin/tests -v
+    "$qat_python" -m unittest discover -s qat_plugin/tests -v
 fi
