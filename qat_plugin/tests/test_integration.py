@@ -5,6 +5,7 @@ from pathlib import Path
 import tempfile
 import types
 import unittest
+from unittest import mock
 
 import torch
 from torch import nn
@@ -97,6 +98,25 @@ class IntegrationTests(unittest.TestCase):
             model = onnx.load(str(path))
             onnx.checker.check_model(model)
             self.assertEqual([x.name for x in model.graph.output], ['p3', 'p4', 'p5'])
+
+    def test_evaluation_records_per_class_without_legacy_plots(self):
+        import numpy as np
+        import val
+        spec = importlib.util.spec_from_file_location('qat_eval_integration', ROOT/'qat_plugin/run_2026-11-24.py')
+        runtime = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(runtime)
+        ap_result = ([1], [0], [.8], [.6], [.685714], np.array([[.9]*9+[.2]]), [.8], [.1], [0])
+        def fake_run(*args, **kwargs):
+            self.assertFalse(kwargs['plots'])
+            val.ap_per_class([],[],[],[0,0])
+            return (.8,.6,.9,.83,0.,0.,0.), None, None
+        with tempfile.TemporaryDirectory() as folder:
+            with mock.patch.object(val,'ap_per_class', return_value=ap_result) as original:
+                with mock.patch.object(val,'run',side_effect=fake_run):
+                    metric = runtime.evaluate(nn.Identity(),self.detector,{},[],None,Path(folder),2,[128,160])
+                self.assertIs(val.ap_per_class,original)
+            self.assertAlmostEqual(metric['AP95'],.2)
+            self.assertEqual(metric['per_class'][0]['instances'],2)
 
     def test_installer_preserves_source_skips_weights_and_refuses_existing_destination(self):
         spec = importlib.util.spec_from_file_location('qat_install', ROOT / 'qat_plugin/install_2026-11-24.py')

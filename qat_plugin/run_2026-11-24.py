@@ -1,6 +1,9 @@
 #!/usr/bin/env python3
 """Standalone generic W8A8 AIMET PTQ/QAT. Original train.py is not patched."""
 import argparse
+from collections import Counter
+from contextlib import contextmanager
+from copy import deepcopy
 from datetime import datetime, timezone, timedelta
 import hashlib
 import json
@@ -73,15 +76,44 @@ def idle_gpu(device):
 
 
 class LimitedLoader:
+    """Snapshot a fixed smoke subset; clone batches to protect labels from val's in-place crop."""
     def __init__(self, loader, limit):
-        self.loader, self.limit, self.dataset = loader, limit, loader.dataset
+        from itertools import islice
+        self.dataset = loader.dataset
+        self.batches = [deepcopy(batch) for batch in islice(loader, limit)]
+        if not self.batches:
+            raise ValueError("Validation subset is empty")
 
     def __iter__(self):
-        from itertools import islice
-        return iter(islice(self.loader, self.limit))
+        return (deepcopy(batch) for batch in self.batches)
 
     def __len__(self):
-        return min(len(self.loader), self.limit)
+        return len(self.batches)
+
+
+@contextmanager
+def record_ap_metrics(evaluator, names, classes):
+    """Capture original evaluator's AP matrix without enabling its legacy plot threads."""
+    original = evaluator.ap_per_class
+    def capture(*args, **kwargs):
+        result = original(*args, **kwargs)
+        tp, fp, p, r, f1, ap, accuracy, false_alarm, class_ids = result
+        target_classes = args[3] if len(args) > 3 else kwargs["target_cls"]
+        counts = Counter(int(x) for x in target_classes)
+        for i, cls in enumerate(class_ids):
+            cls = int(cls)
+            row = [float(x) for x in ap[i]]
+            if len(row) != 10:
+                raise ValueError("Expected original evaluator AP at IoU 0.50:0.05:0.95")
+            classes.append({"class_id": cls, "name": names[cls], "instances": counts[cls],
+                            "P": float(p[i]), "R": float(r[i]), "F1": float(f1[i]),
+                            "AP50": row[0], "AP50_95": sum(row)/len(row), "AP95": row[-1]})
+        return result
+    evaluator.ap_per_class = capture
+    try:
+        yield
+    finally:
+        evaluator.ap_per_class = original
 
 
 def metrics_dict(values):
@@ -90,32 +122,26 @@ def metrics_dict(values):
 
 
 def delta(lhs, rhs):
-    return {key: 100*(lhs[key]-rhs[key]) for key in ("P", "R", "F1_from_mean_PR", "mAP50", "mAP50_95")}
+    keys = ["P", "R", "F1_from_mean_PR", "mAP50", "mAP50_95"]
+    if lhs.get("AP95") is not None and rhs.get("AP95") is not None:
+        keys.append("AP95")
+    return {key: 100*(lhs[key]-rhs[key]) for key in keys}
 
 
 def evaluate(raw, detector, data, loader, loss_fn, output, batch_size, image_size):
-    import torch
     from qat_plugin.model import DecodedDetector
-    from utils.callbacks import Callbacks
     import val
     output.mkdir(parents=True, exist_ok=True)
     classes = []
-    def capture(nt, tp, fp, p, r, f1, ap, ap50, ap_class, confusion):
-        for index, cls in enumerate(ap_class):
-            cls = int(cls)
-            name = detector.names[cls]
-            classes.append({"class_id": cls, "name": name, "instances": int(nt[cls]),
-                            "P": float(p[index]), "R": float(r[index]), "F1": float(f1[index]),
-                            "AP50": float(ap50[index]), "AP50_95": float(ap[index].mean()) if ap[index].ndim else float(ap[index])})
-    callbacks = Callbacks()
-    callbacks.register_action("on_val_end", callback=capture)
     adapter = DecodedDetector(raw, detector).eval()
     # compute_loss makes val use (decoded, raw); labels/cropping/NMS stay in the original evaluator.
-    results, maps, _ = val.run(data, model=adapter, dataloader=loader, compute_loss=loss_fn,
-                              imgsz=image_size, batch_size=batch_size, half=False, plots=True,
-                              verbose=True, callbacks=callbacks, save_dir=output)
+    with record_ap_metrics(val, detector.names, classes):
+        results, maps, _ = val.run(data, model=adapter, dataloader=loader, compute_loss=loss_fn,
+                                  imgsz=image_size, batch_size=batch_size, half=False, plots=False,
+                                  verbose=True, save_dir=output)
     metric = metrics_dict(results)
     metric.update(per_class=classes, split="validation", latency_measured=False)
+    metric["AP95"] = sum(row["AP95"] for row in classes)/len(classes) if classes else None
     # val.py's speed is deliberately not promoted to an INT8/edge latency measurement.
     json_save(output / "metrics.json", metric)
     return metric
@@ -229,8 +255,11 @@ def run(args, output):
     manifest = json.loads(json.dumps(manifest, default=str))
     if args.smoke:
         val_loader = LimitedLoader(val_loader, 2)
+        manifest["smoke_validation_files"] = [str(path) for batch in val_loader.batches for path in batch[3]]
     summary = {"status": "running", "smoke_only": args.smoke, "metrics": {}, "changes_pp": {},
-               "test_evaluated": False, "edge_latency_measured": False, "selection": "0.1*mAP50+0.9*mAP50_95"}
+               "test_evaluated": False, "edge_latency_measured": False, "selection": "0.1*mAP50+0.9*mAP50_95",
+               "accuracy_comparison_enabled": not args.smoke,
+               "metrics_note": "Smoke metrics are diagnostic only; no accuracy-gain claims." if args.smoke else "Full fixed validation split."}
     summary["metrics"]["FP32"] = evaluate(raw, detector, data, val_loader, loss_fn, output / "fp32", args.val_batch, image_size)
     sim = None
     if args.mode != "float-control":
@@ -257,7 +286,8 @@ def run(args, output):
         sim.compute_encodings(calibrate)
         manifest["quantizers"] = inventory(raw)
         summary["metrics"]["PTQ_W8A8"] = evaluate(raw, detector, data, val_loader, loss_fn, output / "ptq", args.val_batch, image_size)
-        summary["changes_pp"]["PTQ_minus_FP32"] = delta(summary["metrics"]["PTQ_W8A8"], summary["metrics"]["FP32"])
+        if not args.smoke:
+            summary["changes_pp"]["PTQ_minus_FP32"] = delta(summary["metrics"]["PTQ_W8A8"], summary["metrics"]["FP32"])
     json_save(output / "manifest.json", manifest)
     json_save(output / "summary.json", summary)
     initial_key = "FP32" if sim is None else "PTQ_W8A8"
@@ -314,9 +344,10 @@ def run(args, output):
     key = "QAT_W8A8_selected" if sim else "FP32_control_selected"
     if args.mode != "ptq":
         summary["metrics"][key] = best
-        summary["changes_pp"][key + "_minus_FP32"] = delta(best, summary["metrics"]["FP32"])
-        if sim:
-            summary["changes_pp"]["QAT_minus_PTQ"] = delta(best, summary["metrics"]["PTQ_W8A8"])
+        if not args.smoke:
+            summary["changes_pp"][key + "_minus_FP32"] = delta(best, summary["metrics"]["FP32"])
+            if sim:
+                summary["changes_pp"]["QAT_minus_PTQ"] = delta(best, summary["metrics"]["PTQ_W8A8"])
     summary["best_epoch"] = best_epoch
     summary["selection_includes_initial_model"] = True
     summary["qat_selected_initial_ptq"] = args.mode == "qat" and best_epoch == -1
