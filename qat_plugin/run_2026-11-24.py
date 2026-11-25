@@ -25,7 +25,7 @@ def environment():
         if sys.version_info < (3, 10):
             raise RuntimeError("AIMET 2.44 requires Python >=3.10; keep the original yolov5 environment unchanged")
         from importlib.metadata import version
-        result["packages"] = {key: version(key) for key in ("torch", "torchvision", "aimet-torch", "onnx")}
+        result["packages"] = {key: version(key) for key in ("torch", "torchvision", "aimet-torch", "onnx", "setuptools")}
         if result["packages"]["aimet-torch"] != "2.44.0":
             raise RuntimeError("This integration targets aimet-torch==2.44.0; use a separate compatible environment")
         import torch
@@ -35,6 +35,11 @@ def environment():
         result["torch_cuda"] = torch.version.cuda
         result["cuda_available"] = torch.cuda.is_available()
         result["aimet_import_ok"] = bool(QuantizationSimModel and custom.Add and aimet_torch.onnx.export)
+        try:
+            import pkg_resources  # legacy project's utils.general imports this package
+        except ImportError as exc:
+            raise RuntimeError("Legacy YOLO needs pkg_resources. In the isolated server environment run: python -m pip install setuptools==80.9.0") from exc
+        result["legacy_pkg_resources_import_ok"] = bool(pkg_resources.parse_version)
         result["compatible"] = True
     except Exception as exc:
         result.update(compatible=False, error=str(exc))

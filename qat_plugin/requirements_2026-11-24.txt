@@ -1,4 +1,6 @@
 # Separate environment only. Install a compatible torch CUDA wheel separately for GPU use.
+# Legacy utils/general.py imports pkg_resources, removed in setuptools 82.
+setuptools==80.9.0
 aimet-torch==2.44.0
 torch==2.5.1
 torchvision==0.20.1
