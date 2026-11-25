@@ -64,6 +64,7 @@ class IntegrationTests(unittest.TestCase):
         raw = prepare_detector(self.detector, TEST_OPS, x[:1])
         for p in raw.parameters():
             p.requires_grad_(True)
+        self.assertTrue(all(p.is_leaf for p in raw.parameters()), "BN folding must leave optimizer-ready leaf parameters")
         raw.train()
         first = raw.layers[0].conv.weight
         before = first.detach().clone()

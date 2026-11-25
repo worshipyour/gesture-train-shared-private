@@ -121,9 +121,19 @@ def prepare_detector(detector, ops, dummy):
     source = deepcopy(detector).float().eval()
     with torch.no_grad():
         expected, expected_raw = source(dummy)
-    prepared = deepcopy(source).fuse().eval()
+    prepared = deepcopy(source)
+    # Original inference fuser copies expressions involving trainable source weights
+    # into frozen Conv parameters. With grad enabled, copy_ attaches CopyBackwards
+    # and makes the destination a non-leaf tensor. BN folding is initialization,
+    # not a training operation; avoid recording that temporary fusion graph.
+    with torch.no_grad():
+        prepared.fuse()
+    prepared.eval()
     prepare_ops(prepared, ops)
     raw = RawDetector(prepared).eval()
+    non_leaf = [name for name, parameter in raw.named_parameters() if not parameter.is_leaf]
+    if non_leaf:
+        raise RuntimeError("Prepared optimizer parameters must be leaf tensors: " + ", ".join(non_leaf))
     adapter = DecodedDetector(raw, source).eval()
     with torch.no_grad():
         actual, actual_raw = adapter(dummy)
